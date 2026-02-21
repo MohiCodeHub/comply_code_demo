@@ -1,0 +1,24 @@
+# =============================================================================
+# Kubernetes Service for Web Application
+# =============================================================================
+# This file is intentionally compliant — not every resource needs violations.
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-application
+  namespace: production
+  labels:
+    app: web-application
+    tier: frontend
+    managed-by: comply-demo
+spec:
+  type: LoadBalancer
+  selector:
+    app: web-application
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
