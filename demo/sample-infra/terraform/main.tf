@@ -1,8 +1,8 @@
 # =============================================================================
-# Sample Production Infrastructure — Intentionally Non-Compliant
+# Sample Production Infrastructure — Corrected and Compliant
 # =============================================================================
-# WARNING: This file contains intentional security and compliance violations
-# for demonstration and testing purposes. DO NOT deploy this configuration.
+# WARNING: This file has been remediated to remove intentional security and
+# compliance violations.
 # =============================================================================
 
 terraform {
@@ -46,6 +46,79 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
+data "aws_caller_identity" "current" {}
+
+# -----------------------------------------------------------------------------
+# KMS Keys for Encryption
+# -----------------------------------------------------------------------------
+
+resource "aws_kms_key" "rds_encryption_key" {
+  description             = "${var.environment}-rds-encryption-key"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid       = "Enable IAM User Permissions",
+        Effect    = "Allow",
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" },
+        Action    = "kms:*",
+        Resource  = "*"
+      },
+      {
+        Sid       = "Allow RDS to use key",
+        Effect    = "Allow",
+        Principal = { Service = "rds.amazonaws.com" },
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ],
+        Resource = "*"
+      }
+    ]
+  })
+  tags = {
+    Name        = "${var.environment}-rds-encryption-key"
+    Environment = var.environment
+  }
+}
+
+resource "aws_kms_key" "s3_data_lake_encryption_key" {
+  description             = "${var.environment}-s3-data-lake-encryption-key"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid       = "Enable IAM User Permissions",
+        Effect    = "Allow",
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" },
+        Action    = "kms:*",
+        Resource  = "*"
+      },
+      {
+        Sid       = "Allow S3 to use key for bucket",
+        Effect    = "Allow",
+        Principal = { Service = "s3.amazonaws.com" },
+        Action = [
+          "kms:GenerateDataKey",
+          "kms:Decrypt"
+        ],
+        Resource = "*"
+      }
+    ]
+  })
+  tags = {
+    Name        = "${var.environment}-s3-data-lake-encryption-key"
+    Environment = var.environment
+  }
+}
+
 # -----------------------------------------------------------------------------
 # VPC & Networking
 # -----------------------------------------------------------------------------
@@ -81,6 +154,16 @@ resource "aws_subnet" "private" {
   }
 }
 
+resource "aws_subnet" "private_az2" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.3.0/24"
+  availability_zone = data.aws_availability_zones.available.names[2]
+
+  tags = {
+    Name = "${var.environment}-private-subnet-az2"
+  }
+}
+
 resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
 
@@ -90,19 +173,87 @@ resource "aws_internet_gateway" "main" {
 }
 
 # -----------------------------------------------------------------------------
-# VIOLATION: RDS Instance — Unencrypted, No Backups, No HA, No Monitoring
-#
-# Violates:
-#   - DORA Art 9(3)(b)  — encryption of data at rest
-#   - DORA Art 9(4)(c)  — data integrity and confidentiality
-#   - DORA Art 11(1)    — backup and recovery
-#   - GDPR Art 32(1)(a) — encryption of personal data
-#   - GDPR Art 32(1)(c) — availability and resilience of processing systems
+# Security Groups
+# -----------------------------------------------------------------------------
+
+resource "aws_security_group" "app_sg" {
+  name        = "${var.environment}-app-sg"
+  description = "Security group for application servers and DB access"
+  vpc_id      = aws_vpc.main.id
+
+  # Allow HTTP/80 traffic from the ALB
+  ingress {
+    description     = "Allow HTTP from ALB"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
+  }
+
+  # Allow PostgreSQL/5432 traffic from application servers within this SG
+  ingress {
+    description = "Allow Postgres from App Servers"
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    self        = true # Allows resources in this SG to talk to each other on this port
+  }
+
+  egress {
+    description = "Allow all outbound traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.environment}-app-sg"
+  }
+}
+
+resource "aws_security_group" "alb_sg" {
+  name        = "${var.environment}-alb-sg"
+  description = "Security group for Application Load Balancer"
+  vpc_id      = aws_vpc.main.id
+
+  # Allow HTTP (80) from within the VPC (for redirect if needed, but primary access is HTTPS)
+  ingress {
+    description = "Allow HTTP from VPC"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.main.cidr_block]
+  }
+
+  # Allow HTTPS (443) from within the VPC (or specific external access points)
+  ingress {
+    description = "Allow HTTPS from VPC"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.main.cidr_block]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.environment}-alb-sg"
+  }
+}
+
+# -----------------------------------------------------------------------------
+# RDS Instance
 # -----------------------------------------------------------------------------
 
 resource "aws_db_subnet_group" "main" {
   name       = "${var.environment}-db-subnet-group"
-  subnet_ids = [aws_subnet.public.id, aws_subnet.private.id]
+  subnet_ids = [aws_subnet.private.id, aws_subnet.private_az2.id] # Use only private subnets for Multi-AZ DB
 
   tags = {
     Name = "${var.environment}-db-subnet-group"
@@ -125,38 +276,38 @@ resource "aws_db_instance" "customer_data" {
   db_subnet_group_name   = aws_db_subnet_group.main.name
   vpc_security_group_ids = [aws_security_group.app_sg.id]
 
-  # VIOLATION: Storage encryption disabled — data at rest is unprotected
-  storage_encrypted = false
-  # VIOLATION: No KMS key specified (kms_key_id omitted)
-
-  # VIOLATION: Backup retention set to zero — no automated backups
-  backup_retention_period = 0
-
-  # VIOLATION: Multi-AZ disabled — single point of failure, no HA
-  multi_az = false
-
-  # VIOLATION: Enhanced monitoring disabled (monitoring_interval omitted)
-  # VIOLATION: Performance Insights disabled (performance_insights_enabled omitted)
+  storage_encrypted       = true # Remediation: Storage encryption enabled
+  kms_key_id              = aws_kms_key.rds_encryption_key.arn # Remediation: KMS key specified
+  backup_retention_period = 7 # Remediation: Automated backups enabled (7 days)
+  multi_az                = true # Remediation: Multi-AZ enabled for HA
+  monitoring_interval     = 60 # Remediation: Enhanced monitoring enabled (60 seconds)
+  performance_insights_enabled = true # Remediation: Performance Insights enabled
 
   publicly_accessible = false
   skip_final_snapshot = true
 
   tags = {
-    Name        = "${var.environment}-customer-data"
-    DataClass   = "confidential"
-    Contains    = "PII"
+    Name      = "${var.environment}-customer-data"
+    DataClass = "confidential"
+    Contains  = "PII"
   }
 }
 
 # -----------------------------------------------------------------------------
-# VIOLATION: S3 Bucket — No Server-Side Encryption
-#
-# Violates:
-#   - CIS AWS 2.1.1 — Ensure S3 bucket encryption is enabled
+# S3 Bucket
 # -----------------------------------------------------------------------------
 
 resource "aws_s3_bucket" "data_lake" {
-  bucket = "${var.environment}-comply-demo-data-lake"
+  bucket = "${var.environment}-comply-demo-data-lake-${data.aws_caller_identity.current.account_id}"
+
+  server_side_encryption_configuration { # Remediation: Server-side encryption enabled
+    rule {
+      apply_server_side_encryption_by_default {
+        kms_master_key_id = aws_kms_key.s3_data_lake_encryption_key.arn
+        sse_algorithm     = "aws:kms"
+      }
+    }
+  }
 
   tags = {
     Name      = "${var.environment}-data-lake"
@@ -164,28 +315,25 @@ resource "aws_s3_bucket" "data_lake" {
   }
 }
 
-# VIOLATION: No aws_s3_bucket_server_side_encryption_configuration resource
-# for the data_lake bucket. Data is stored unencrypted.
+resource "aws_s3_bucket_public_access_block" "data_lake_public_access_block" { # Remediation: Public access blocked
+  bucket = aws_s3_bucket.data_lake.id
 
-# VIOLATION: No aws_s3_bucket_public_access_block for the data_lake bucket
-#
-# Violates:
-#   - CIS AWS 2.1.2 — Ensure S3 bucket policy is set to deny HTTP requests
-#                      and public access is blocked
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
 
 resource "aws_s3_bucket_versioning" "data_lake" {
   bucket = aws_s3_bucket.data_lake.id
 
   versioning_configuration {
-    status = "Suspended"
+    status = "Enabled" # Remediation: Versioning enabled for data integrity
   }
 }
 
 # -----------------------------------------------------------------------------
-# VIOLATION: EC2 Instance — Detailed Monitoring Disabled
-#
-# Violates:
-#   - DORA Art 10 — Detection of anomalous activities
+# EC2 Instance
 # -----------------------------------------------------------------------------
 
 resource "aws_instance" "app_server" {
@@ -195,8 +343,7 @@ resource "aws_instance" "app_server" {
 
   vpc_security_group_ids = [aws_security_group.app_sg.id]
 
-  # VIOLATION: Detailed monitoring disabled
-  monitoring = false
+  monitoring = true # Remediation: Detailed monitoring enabled
 
   root_block_device {
     volume_size = 50
@@ -219,53 +366,15 @@ resource "aws_instance" "app_server" {
 }
 
 # -----------------------------------------------------------------------------
-# VIOLATION: Security Group — Unrestricted Inbound Access
-#
-# Violates:
-#   - GDPR Art 32(1)(b) — Ability to ensure confidentiality of processing systems
-#   - CIS AWS 4.1       — Ensure no security group allows ingress from 0.0.0.0/0
-# -----------------------------------------------------------------------------
-
-resource "aws_security_group" "app_sg" {
-  name        = "${var.environment}-app-sg"
-  description = "Security group for application servers"
-  vpc_id      = aws_vpc.main.id
-
-  # VIOLATION: All traffic allowed from any source
-  ingress {
-    description = "Allow all inbound traffic"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    description = "Allow all outbound traffic"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "${var.environment}-app-sg"
-  }
-}
-
-# -----------------------------------------------------------------------------
-# VIOLATION: Load Balancer Listener — HTTP (Unencrypted)
-#
-# Violates:
-#   - DORA Art 9(3)(c) — Encryption of data in transit
+# Load Balancer & Listeners
 # -----------------------------------------------------------------------------
 
 resource "aws_lb" "app" {
   name               = "${var.environment}-app-lb"
   internal           = false
   load_balancer_type = "application"
-  security_groups    = [aws_security_group.app_sg.id]
-  subnets            = [aws_subnet.public.id, aws_subnet.private.id]
+  security_groups    = [aws_security_group.alb_sg.id] # Remediation: Use dedicated ALB security group
+  subnets            = [aws_subnet.public.id, aws_subnet.private.id] # ALB should span multiple subnets
 
   tags = {
     Name = "${var.environment}-app-lb"
@@ -292,18 +401,36 @@ resource "aws_lb_target_group" "app" {
   }
 }
 
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.app.arn
-  port              = 80
+resource "aws_acm_certificate" "app_cert" {
+  domain_name       = "example.com" # Placeholder: Replace with your actual domain
+  validation_method = "DNS"
+  tags = {
+    Name        = "${var.environment}-app-cert"
+    Environment = var.environment
+  }
+  lifecycle {
+    create_before_destroy = true
+  }
+  # IMPORTANT: For production, you would need to add `aws_route53_record` resources
+  # here for DNS validation, or use a pre-existing validated certificate.
+}
 
-  # VIOLATION: Using HTTP instead of HTTPS — data in transit is unencrypted
-  protocol = "HTTP"
+resource "aws_lb_listener" "https" { # Remediation: HTTPS listener
+  load_balancer_arn = aws_lb.app.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08" # Using a secure SSL policy
+  certificate_arn   = aws_acm_certificate.app_cert.arn
 
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.app.arn
   }
+  tags = {
+    Name = "${var.environment}-app-lb-https-listener"
+  }
 }
+
 
 resource "aws_lb_target_group_attachment" "app" {
   target_group_arn = aws_lb_target_group.app.arn
@@ -312,26 +439,158 @@ resource "aws_lb_target_group_attachment" "app" {
 }
 
 # -----------------------------------------------------------------------------
-# VIOLATION: No CloudTrail Configuration
-#
-# Violates:
-#   - DORA Art 10 — ICT-related incident detection and monitoring
-#
-# A compliant setup would include:
-#   resource "aws_cloudtrail" "main" { ... }
+# CloudTrail Configuration for Monitoring and Detection
 # -----------------------------------------------------------------------------
 
+resource "aws_s3_bucket" "cloudtrail_log_bucket" {
+  bucket = "${var.environment}-cloudtrail-logs-${data.aws_caller_identity.current.account_id}"
+  acl    = "private"
+
+  server_side_encryption_configuration {
+    rule {
+      apply_server_side_encryption_by_default {
+        sse_algorithm = "AES256"
+      }
+    }
+  }
+
+  versioning {
+    enabled = true
+  }
+
+  tags = {
+    Name        = "${var.environment}-cloudtrail-logs"
+    Environment = var.environment
+  }
+}
+
+data "aws_iam_policy_document" "cloudtrail_bucket_policy" {
+  statement {
+    sid       = "AllowCloudTrailPutObject"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.cloudtrail_log_bucket.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/*"]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+  }
+  statement {
+    sid       = "AllowCloudTrailGetBucketAcl"
+    actions   = ["s3:GetBucketAcl"]
+    resources = [aws_s3_bucket.cloudtrail_log_bucket.arn]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "cloudtrail_bucket_policy" {
+  bucket = aws_s3_bucket.cloudtrail_log_bucket.id
+  policy = data.aws_iam_policy_document.cloudtrail_bucket_policy.json
+}
+
+
+resource "aws_cloudtrail" "main" { # Remediation: CloudTrail configured
+  name                          = "${var.environment}-main-cloudtrail"
+  s3_bucket_name                = aws_s3_bucket.cloudtrail_log_bucket.id
+  is_multi_region_trail         = true
+  include_global_service_events = true
+  enable_logging                = true
+  enable_log_file_validation    = true # Recommended for integrity
+
+  tags = {
+    Name        = "${var.environment}-main-cloudtrail"
+    Environment = var.environment
+  }
+}
+
 # -----------------------------------------------------------------------------
-# VIOLATION: No CloudWatch Alarms
-#
-# Violates:
-#   - DORA Art 12 — ICT-related incident classification and reporting
-#
-# A compliant setup would include:
-#   resource "aws_cloudwatch_metric_alarm" "cpu_high" { ... }
-#   resource "aws_cloudwatch_metric_alarm" "db_connections" { ... }
-#   resource "aws_cloudwatch_metric_alarm" "error_rate" { ... }
+# CloudWatch Alarms for Incident Detection and Reporting
 # -----------------------------------------------------------------------------
+
+resource "aws_sns_topic" "cloudwatch_alerts" {
+  name = "${var.environment}-cloudwatch-alerts-topic"
+  tags = {
+    Name        = "${var.environment}-cloudwatch-alerts-topic"
+    Environment = var.environment
+  }
+}
+
+resource "aws_sns_topic_subscription" "email_subscription" {
+  topic_arn = aws_sns_topic.cloudwatch_alerts.arn
+  protocol  = "email"
+  endpoint  = "security-team@example.com" # Placeholder: Replace with actual email
+}
+
+resource "aws_cloudwatch_metric_alarm" "ec2_high_cpu_alarm" { # Remediation: EC2 CPU alarm
+  alarm_name          = "${var.environment}-ec2-app-server-high-cpu"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "80"
+  alarm_description   = "This alarm monitors EC2 app server CPU utilization"
+  actions_enabled     = true
+  alarm_actions       = [aws_sns_topic.cloudwatch_alerts.arn]
+  ok_actions          = [aws_sns_topic.cloudwatch_alerts.arn]
+
+  dimensions = {
+    InstanceId = aws_instance.app_server.id
+  }
+  tags = {
+    Name        = "${var.environment}-ec2-app-server-high-cpu-alarm"
+    Environment = var.environment
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "rds_high_cpu_alarm" { # Remediation: RDS CPU alarm
+  alarm_name          = "${var.environment}-rds-customer-data-high-cpu"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/RDS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "80"
+  alarm_description   = "This alarm monitors RDS customer data CPU utilization"
+  actions_enabled     = true
+  alarm_actions       = [aws_sns_topic.cloudwatch_alerts.arn]
+  ok_actions          = [aws_sns_topic.cloudwatch_alerts.arn]
+
+  dimensions = {
+    DBInstanceIdentifier = aws_db_instance.customer_data.id
+  }
+  tags = {
+    Name        = "${var.environment}-rds-customer-data-high-cpu-alarm"
+    Environment = var.environment
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "rds_high_connections_alarm" { # Remediation: RDS Connections alarm
+  alarm_name          = "${var.environment}-rds-customer-data-high-connections"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "DatabaseConnections"
+  namespace           = "AWS/RDS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "90"
+  alarm_description   = "This alarm monitors high database connections to customer data RDS"
+  actions_enabled     = true
+  alarm_actions       = [aws_sns_topic.cloudwatch_alerts.arn]
+  ok_actions          = [aws_sns_topic.cloudwatch_alerts.arn]
+
+  dimensions = {
+    DBInstanceIdentifier = aws_db_instance.customer_data.id
+  }
+  tags = {
+    Name        = "${var.environment}-rds-customer-data-high-connections-alarm"
+    Environment = var.environment
+  }
+}
 
 # =============================================================================
 # Outputs
